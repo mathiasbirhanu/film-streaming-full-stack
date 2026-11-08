@@ -1,0 +1,213 @@
+// StreamRoots — domain model
+// NOTE: datasource is PostgreSQL (user-space server on :5433 in the sandbox).
+// Status/role fields are stored as String so the schema also runs on SQLite
+// for offline tests; on a native PG deployment these can graduate to native
+// enums without any application changes — all values are validated at the
+// service layer. Schema ownership stays with Prisma: the .NET backend
+// (backend/StreamRoots.Api) reads/writes the SAME tables, it never migrates.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ── Identity & access ──────────────────────────────────────────────
+// role: VIEWER | PRODUCER | ADMIN
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  name         String
+  passwordHash String
+  role         String   @default("VIEWER")
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  memberships   Membership[]
+  purchases     Purchase[]
+  resources     Resource[]        @relation("ProducerResources")
+  playlists     Playlist[]        @relation("ProducerPlaylists")
+  progress      ViewingProgress[]
+  ledgerIn      PayoutEntry[]     @relation("ProducerLedger")
+  audits        AuditLog[]        @relation("ActorAudit")
+  notifications Notification[]
+}
+
+// Flat monthly membership. entitlement_type=MEMBERSHIP resolves here.
+model Membership {
+  id          String   @id @default(cuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id])
+  status      String   @default("ACTIVE") // ACTIVE | CANCELED | EXPIRED
+  plan        String   @default("MONTHLY")
+  priceCents  Int      @default(799)
+  startedAt   DateTime @default(now())
+  expiresAt   DateTime
+  provider    String   @default("DEMO") // DEMO | STRIPE
+  providerRef String?
+
+  @@index([userId])
+}
+
+// ── Catalog ────────────────────────────────────────────────────────
+// status: DRAFT | PENDING_REVIEW | PUBLISHED | REJECTED | SUSPENDED
+// pricingType: FREE | MEMBERSHIP | PPV
+// videoSourceType: YOUTUBE | UPLOAD | EXTERNAL  (phase-1 ships YOUTUBE only;
+// the player + playback action branch on this field, nothing else does)
+model Resource {
+  id              String    @id @default(cuid())
+  title           String
+  description     String    @default("")
+  genre           String    @default("General")
+  year            Int?
+  videoSourceType String    @default("YOUTUBE")
+  sourceRef       String // youtube video id (never leaves authenticated endpoints)
+  posterUrl       String? // optional custom poster; falls back to proxied YT thumbnail
+  pricingType     String    @default("PPV")
+  priceCents      Int       @default(0)
+  discountPercent Int       @default(0)
+  discountEndsAt  DateTime?
+  status          String    @default("DRAFT")
+  rejectionReason String?
+  producerId      String?
+  producer        User?     @relation("ProducerResources", fields: [producerId], references: [id])
+  viewCount       Int       @default(0)
+  purchases       Purchase[]
+  progress        ViewingProgress[]
+  ledgerEntries   PayoutEntry[]
+  playlistItems   PlaylistItem[] @relation("PlaylistItems")
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@index([status])
+  @@index([producerId])
+}
+
+// ── Playlists (producer-curated, ordered collections) ────────────────
+// status: DRAFT | PUBLISHED — curation only, no extra moderation round:
+// only PUBLISHED titles owned by the producer can be attached, and the
+// detail read re-filters so a title demoted mid-review disappears.
+model Playlist {
+  id          String   @id @default(cuid())
+  title       String
+  description String   @default("")
+  status      String   @default("DRAFT")
+  producerId  String
+  producer    User     @relation("ProducerPlaylists", fields: [producerId], references: [id])
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  items       PlaylistItem[]
+
+  @@index([producerId])
+  @@index([status])
+}
+
+// Ordered list entries. position is 1..n; gaps after removals are fine
+// (reads order by position asc) — move = swap two positions in a txn.
+model PlaylistItem {
+  id         String   @id @default(cuid())
+  playlistId String
+  playlist   Playlist @relation(fields: [playlistId], references: [id], onDelete: Cascade)
+  resourceId String
+  resource   Resource @relation("PlaylistItems", fields: [resourceId], references: [id], onDelete: Cascade)
+  position   Int
+
+  @@unique([playlistId, resourceId])
+  @@index([playlistId])
+  @@index([resourceId])
+}
+
+// ── Entitlements ───────────────────────────────────────────────────
+// kind: PPV_LIFETIME (rental window is the phase-2 extension)
+model Purchase {
+  id          String   @id @default(cuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id])
+  resourceId  String
+  resource    Resource @relation(fields: [resourceId], references: [id])
+  kind        String   @default("PPV_LIFETIME")
+  amountCents Int
+  status      String   @default("COMPLETED")
+  provider    String   @default("DEMO")
+  providerRef String?
+  createdAt   DateTime @default(now())
+
+  @@unique([userId, resourceId, kind])
+  @@index([userId])
+}
+
+// resume playback + per-title watch analytics for producers
+model ViewingProgress {
+  id              String   @id @default(cuid())
+  userId          String
+  user            User     @relation(fields: [userId], references: [id])
+  resourceId      String
+  resource        Resource @relation(fields: [resourceId], references: [id])
+  positionSeconds Int      @default(0)
+  durationSeconds Int      @default(0)
+  updatedAt       DateTime @updatedAt
+
+  @@unique([userId, resourceId])
+  @@index([userId])
+}
+
+// ── Money (day-one ledger, the piece that must never be retrofitted) ──
+// type: EARNED (producer share) | PLATFORM_FEE | PAYOUT
+// status: PENDING | PAYABLE | PAID
+model PayoutEntry {
+  id         String   @id @default(cuid())
+  producerId String?
+  producer   User?    @relation("ProducerLedger", fields: [producerId], references: [id])
+  resourceId String
+  resource   Resource @relation(fields: [resourceId], references: [id])
+  purchaseId String?
+  type       String   @default("EARNED")
+  amountCents Int
+  status     String   @default("PAYABLE")
+  createdAt  DateTime @default(now())
+
+  @@index([producerId])
+}
+
+// ── Notifications (campaign blasts + system notices) ──────────────
+// kind: CAMPAIGN (admin discount announcements) | SYSTEM (platform notices)
+model Notification {
+  id         String    @id @default(cuid())
+  userId     String
+  user       User      @relation(fields: [userId], references: [id])
+  kind       String    @default("CAMPAIGN")
+  title      String
+  body       String    @default("")
+  resourceId String?
+  readAt     DateTime?
+  createdAt  DateTime  @default(now())
+
+  @@index([userId])
+}
+
+// ── Platform configuration (admin-controlled key/value store) ────────
+// producerShareBps stores the producer cut in basis points (7000 = 70%)
+// so split math stays integer-exact. Absent key → service default 7000.
+// Every purchase snapshots the current share at charge time, so ledger
+// history never shifts when the admin retunes the percentage.
+model Setting {
+  key       String   @id
+  value     String
+  updatedAt DateTime @updatedAt
+}
+
+// ── Moderation trail ───────────────────────────────────────────────
+model AuditLog {
+  id         String   @id @default(cuid())
+  actorId    String?
+  actor      User?    @relation("ActorAudit", fields: [actorId], references: [id])
+  action     String
+  resourceId String?
+  detail     String?
+  createdAt  DateTime @default(now())
+
+  @@index([resourceId])
+}
